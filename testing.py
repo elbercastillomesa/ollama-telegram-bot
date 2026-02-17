@@ -1,5 +1,6 @@
 import logging
 import os
+import requests
 from dotenv import load_dotenv
 from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.ext import (
@@ -8,173 +9,90 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
     MessageHandler,
-    PicklePersistence,
     filters,
 )
 
-load_dotenv()  # reads variables from .env file and sets them in os.environ
-telegram_bot_api_key = os.getenv("TELEGRAM_BOT_API_KEY")
+# Load environment variables
+load_dotenv()
+LLM_MODEL = os.getenv("LLM_MODEL")
+TOKEN = os.getenv("TELEGRAM_BOT_API_KEY")
+OLLAMA_URL = "http://localhost:11434/api/generate"
 
-#!/usr/bin/env python
-# pylint: disable=unused-argument
-# This program is dedicated to the public domain under the CC0 license.
-
-"""
-First, a few callback functions are defined. Then, those functions are passed to
-the Application and registered at their respective places.
-Then, the bot is started and runs until we press Ctrl-C on the command line.
-
-Usage:
-Example of a bot-user conversation using ConversationHandler.
-Send /start to initiate the conversation.
-Press Ctrl-C on the command line or send a signal to the process to stop the
-bot.
-"""
-
-# Enable logging
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-# set higher logging level for httpx to avoid all GET and POST requests being logged
-logging.getLogger("httpx").setLevel(logging.WARNING)
-
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-CHOOSING, TYPING_REPLY, TYPING_CHOICE = range(3)
-
-reply_keyboard = [
-    ["Age", "Favourite colour"],
-    ["Number of siblings", "Something else..."],
-    ["Done"],
-]
-markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True)
-
-
-def facts_to_str(user_data: dict[str, str]) -> str:
-    """Helper function for formatting the gathered user info."""
-    facts = [f"{key} - {value}" for key, value in user_data.items()]
-    return "\n".join(facts).join(["\n", "\n"])
-
+# Conversation state
+CHAT = range(1)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Start the conversation, display any stored data and ask user for input."""
-    reply_text = "Hi! My name is Doctor Botter."
-    if context.user_data:
-        reply_text += (
-            f" You already told me your {', '.join(context.user_data.keys())}. Why don't you "
-            "tell me something more about yourself? Or change anything I already know."
-        )
-    else:
-        reply_text += (
-            " I will hold a more complex conversation with you. Why don't you tell me "
-            "something about yourself?"
-        )
-    await update.message.reply_text(reply_text, reply_markup=markup)
-
-    return CHOOSING
-
-
-async def regular_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Ask the user for info about the selected predefined choice."""
-    text = update.message.text.lower()
-    context.user_data["choice"] = text
-    if context.user_data.get(text):
-        reply_text = (
-            f"Your {text}? I already know the following about that: {context.user_data[text]}"
-        )
-    else:
-        reply_text = f"Your {text}? Yes, I would love to hear about that!"
-    await update.message.reply_text(reply_text)
-
-    return TYPING_REPLY
-
-
-async def custom_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Ask the user for a description of a custom category."""
+    """Start chat and clear previous memory."""
+    context.user_data["ollama_context"] = [] # Clear memory at startup
+    
+    reply_markup = ReplyKeyboardMarkup([['Done']], one_time_keyboard=True, resize_keyboard=True)
     await update.message.reply_text(
-        'Alright, please send me the category first, for example "Most impressive skill"'
+        f"Memory activated. I'm your assistant on Odroid C2.\nModel: {LLM_MODEL}\n\nHow can I help you?",
+        reply_markup=reply_markup
     )
+    return CHAT
 
-    return TYPING_CHOICE
+async def chat_with_ollama(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_text = update.message.text
+    await update.message.reply_chat_action("typing")
+    
+    # Retrieve the context (the "memory") stored in the user session
+    history = context.user_data.get("ollama_context", [])
 
+    try:
+        payload = {
+            "model": LLM_MODEL,
+            "prompt": user_text,
+            "system": "You are an AI assistant. Your responses MUST be very short and direct. Maximum 2 sentences.",
+            "context": history, # Send the context numbers from the previous response
+            "stream": False,
+            "options": {
+                "num_predict": 250, # Force short response to save RAM
+                "temperature": 0.7
+            }
+        }
+        
+        response = requests.post(OLLAMA_URL, json=payload, timeout=300)
+        
+        if response.status_code == 200:
+            data = response.json()
+            answer = data.get('response', 'I have no response.')
+            
+            # SAVE the new context for the next question
+            context.user_data["ollama_context"] = data.get("context")
+            
+            await update.message.reply_text(answer)
+        else:
+            await update.message.reply_text(f"Error {response.status_code} in Ollama.")
+            
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        await update.message.reply_text("Memory or connection error. Try with something shorter.")
 
-async def received_information(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Store info provided by user and ask for the next category."""
-    text = update.message.text
-    category = context.user_data["choice"]
-    context.user_data[category] = text.lower()
-    del context.user_data["choice"]
+    return CHAT
 
-    await update.message.reply_text(
-        "Neat! Just so you know, this is what you already told me:"
-        f"{facts_to_str(context.user_data)}"
-        "You can tell me more, or change your opinion on something.",
-        reply_markup=markup,
-    )
-
-    return CHOOSING
-
-
-async def show_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Display the gathered info."""
-    await update.message.reply_text(
-        f"This is what you already told me: {facts_to_str(context.user_data)}"
-    )
-
-
-async def done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Display the gathered info and end the conversation."""
-    if "choice" in context.user_data:
-        del context.user_data["choice"]
-
-    await update.message.reply_text(
-        f"I learned these facts about you: {facts_to_str(context.user_data)}Until next time!",
-        reply_markup=ReplyKeyboardRemove(),
-    )
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """End and clear session data."""
+    context.user_data.clear() 
+    await update.message.reply_text("History cleared. Goodbye!", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
-
 def main() -> None:
-    """Run the bot."""
-    # Create the Application and pass it your bot's token.
-    persistence = PicklePersistence(filepath="conversationbot")
-    application = Application.builder().token(telegram_bot_api_key).persistence(persistence).build()
+    application = Application.builder().token(TOKEN).build()
 
-    # Add conversation handler with the states CHOOSING, TYPING_CHOICE and TYPING_REPLY
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            CHOOSING: [
-                MessageHandler(
-                    filters.Regex("^(Age|Favourite colour|Number of siblings)$"), regular_choice
-                ),
-                MessageHandler(filters.Regex("^Something else...$"), custom_choice),
-            ],
-            TYPING_CHOICE: [
-                MessageHandler(
-                    filters.TEXT & ~(filters.COMMAND | filters.Regex("^Done$")), regular_choice
-                )
-            ],
-            TYPING_REPLY: [
-                MessageHandler(
-                    filters.TEXT & ~(filters.COMMAND | filters.Regex("^Done$")),
-                    received_information,
-                )
-            ],
+            CHAT: [MessageHandler(filters.TEXT & ~filters.Regex("^Done$"), chat_with_ollama)],
         },
-        fallbacks=[MessageHandler(filters.Regex("^Done$"), done)],
-        name="my_conversation",
-        persistent=True,
+        fallbacks=[MessageHandler(filters.Regex("^Done$"), stop)],
     )
 
     application.add_handler(conv_handler)
-
-    show_data_handler = CommandHandler("show_data", show_data)
-    application.add_handler(show_data_handler)
-
-    # Run the bot until the user presses Ctrl-C
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
+    application.run_polling()
 
 if __name__ == "__main__":
     main()
